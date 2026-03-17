@@ -3,7 +3,7 @@
 [![arXiv](https://img.shields.io/badge/arXiv-2602.22010-b31b1b.svg)](https://arxiv.org/abs/2602.22010)
 [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://selen-suyue.github.io/WoGNet/)
 
-This is an unofficial implemention of [WoG](https://img.shields.io/badge/Project-Page-blue) based on open source framework and datasets.
+This is an unofficial implemention of [WoG]((https://selen-suyue.github.io/WoGNet/) based on open source framework and datasets.
 
 Thanks to [OpenVLA](https://github.com/openvla/openvla) and [CogACT](https://github.com/microsoft/CogACT) for their awesome codebase.
 
