@@ -14,9 +14,9 @@ Thanks to [OpenVLA](https://github.com/openvla/openvla) and [CogACT](https://git
 
 We are working on releasing the code. Stay tuned!
 
-- [] Release training code
-- [] Release pre-trained checkpoints
-- [] Release Real-World and Simulation inference code
+- [ ✓ ] Release training code
+- [ ] Release pre-trained checkpoints
+- [ ] Release Real-World and Simulation inference code
 
 ## Installation
 ```bash
