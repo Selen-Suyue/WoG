@@ -10,14 +10,6 @@ Thanks to [OpenVLA](https://github.com/openvla/openvla) and [CogACT](https://git
 ![Teaser](assets/teaser.png)
 
 
-## 📝 TODO List
-
-We are working on releasing the code. Stay tuned!
-
-- [ ✓ ] Release training code
-- [ ] Release pre-trained checkpoints
-- [ ] Release Real-World and Simulation inference code
-
 ## Installation
 ```bash
 conda create -n wog python=3.10
@@ -99,6 +91,68 @@ torchrun --standalone --nnodes 1 --nproc-per-node 8 scripts/train.py \
   --action_model_type DiT-L \
   --is_resume False
 ```
+
+## Pretrained Checkpoints
+We provide pretrained checkpoints of the two stages in [huggingface](https://huggingface.co/Selen123/WoG). `WoG-V` is the first-stage and `WoG-A` is the second.
+
+## Evaluation in SIMPLER
+In this section, we provide a minimal evaluation for our models in [SIMPLER](https://simpler-env.github.io/). First, please follow the instruction of [SimplerEnv](https://github.com/simpler-env/SimplerEnv) to install the simulation environment. Next, add our [./deploy](./deploy) to [SimplerEnv/simpler_env/policies](https://github.com/simpler-env/SimplerEnv/tree/main/simpler_env/policies).
+```bash
+cp ./deploy <your_path_to_simpler>/simpler_env/policies -r
+```
+Then add a new policy model in [SimplerEnv/simpler_env/main_inference.py](https://github.com/simpler-env/SimplerEnv/blob/main/simpler_env/main_inference.py) as below:
+```python
+elif args.policy_model == "wog":
+    from simpler_env.policies.deploy import WoGSimInference
+    assert args.ckpt_path is not None
+    model = WoGSimInference(
+        saved_model_path=args.ckpt_path,  
+        policy_setup=args.policy_setup,
+        action_scale=args.action_scale,
+        action_model_type='DiT-L',            
+    )
+```
+After that, you can modify and launch the scripts in [`deploy/scripts`](deploy/scripts) like:
+```bash
+cd <your_path_to_simpler>
+bash simpler_env/policies/deploy/scripts/wog_put_in_drawer_visual_matching.sh
+```
+
+## Evaluation in RealWorld
+We provide a sample of RealWorld Deploy wrapper in [deploy/wog_policy_real.py](deploy/wog_policy_real.py). It's supported by [Maniunicon](https://github.com/Universal-Control/ManiUniCon) and you can also use it in other platforms. 
+
+ManiUnicon is a universal real-world robot control platform for data-collection and model deploy. You can refer the [README](https://github.com/Universal-Control/ManiUniCon/blob/main/README.md) to collect data in rlds format.
+
+Once you have collected rlds dataset, modify the following files in our project:
+- [prismatic/vla/datasets/rlds/oxe/transforms.py](prismatic/vla/datasets/rlds/oxe/transforms.py)
+- [prismatic/vla/datasets/rlds/oxe/mixtures.py](prismatic/vla/datasets/rlds/oxe/mixtures.py)
+- [prismatic/vla/datasets/rlds/oxe/configs.py](prismatic/vla/datasets/rlds/oxe/configs.py)
+
+Then only stage-II is needed for training:
+```bash
+## For RealWorld:
+torchrun --standalone --nnodes 1 --nproc-per-node 8 scripts/train.py \
+  --pretrained_checkpoint <ckpt predtrained in stage I> \
+  --vla.type prism-dinosiglip-224px+oxe+diffusion \
+  --vla.data_mix real_dataset_mix \
+  --vla.expected_world_size 8 \
+  --vla.global_batch_size 256 \
+  --vla.per_device_batch_size 32 \
+  --vla.learning_rate 2e-5 \
+  --data_root_dir <path_to_dataset_dir> \
+  --run_root_dir <path_to_log/checkpoint_dir> \                 
+  --run_id <optional_run_id_for_wandb> \
+  --image_aug <True_or_False> \
+  --wandb_project <your_wandb_project> \
+  --wandb_entity <your_wandb_entity> \
+  --save_interval <num_of_steps_to_save_checkpoint> \
+  --repeated_diffusion_steps 8 \
+  --Ta 16 \
+  --action_model_type DiT-L \
+  --is_resume False
+```
+
+After training, You can follow [wog config in maniunicon](https://github.com/Universal-Control/ManiUniCon/blob/main/configs/policy/wog.yaml) and [wog class in maniunicon](https://github.com/Universal-Control/ManiUniCon/blob/main/maniunicon/customize/policy_model/wog_model.py) to deploy WoG.
 
 
 ## 🔗 Citation
