@@ -1,0 +1,405 @@
+import argparse
+from collections import Counter, defaultdict
+import logging
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+# This is for using the locally installed repo clone when using slurm
+from calvin_agent.models.calvin_base_model import CalvinBaseModel
+
+sys.path.insert(0, Path(__file__).absolute().parents[2].as_posix())
+
+from calvin_agent.evaluation.multistep_sequences import get_sequences
+from calvin_agent.evaluation.utils import (
+    collect_plan,
+    count_success,
+    create_tsne,
+    get_default_model_and_env,
+    get_env_state_for_initial_condition,
+    get_log_dir,
+    join_vis_lang,
+    print_and_save,
+)
+from calvin_agent.utils.utils import get_all_checkpoints, get_checkpoints_for_epochs, get_last_checkpoint
+import hydra
+import numpy as np
+from omegaconf import OmegaConf
+from pytorch_lightning import seed_everything
+from termcolor import colored
+import torch
+from tqdm.auto import tqdm
+
+from calvin_env.envs.play_table_env import get_env
+
+logger = logging.getLogger(__name__)
+
+from collections import deque
+from typing import Optional, Sequence
+from PIL import Image
+import torch
+import cv2 as cv
+import matplotlib.pyplot as plt
+from transforms3d.euler import euler2axangle
+from transformers import AutoModelForVision2Seq, AutoProcessor
+from vla import load_vla
+from deploy.adaptive_ensemble import AdaptiveEnsembler
+
+
+
+EP_LEN = 360
+NUM_SEQUENCES = 1000
+
+def _parse_epoch_from_name(path: Path) -> int | None:
+    m = re.search(r"epoch-(\d+)", path.stem)
+    return int(m.group(1)) if m else None
+
+
+def _select_checkpoints(checkpoints_dir: str, start_epoch: int, max_count: int) -> list[Path]:
+    ckpt_dir = Path(checkpoints_dir)
+    candidates = [p for p in ckpt_dir.glob("*.pt")]
+    items = []
+    for p in candidates:
+        e = _parse_epoch_from_name(p)
+        if e is not None and e >= start_epoch:
+            items.append((e, p))
+    items.sort(key=lambda x: x[0])
+    selected = [p for _, p in (items[-max_count:] if len(items) > max_count else items)]
+    return selected
+
+
+def _spawn_multi_runs(script_path: Path, dataset_path: str, eval_log_dir: str, checkpoints: list[Path], devices: list[int], extra_args: list[str]):
+    procs = []
+    for ckpt, dev in zip(checkpoints, devices):
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(dev)
+        env["PYOPENGL_PLATFORM"] = env.get("PYOPENGL_PLATFORM", "egl")
+        cmd = [sys.executable, script_path.as_posix(), "--checkpoint", ckpt.as_posix(), "--dataset_path", dataset_path, "--eval_log_dir", eval_log_dir] + extra_args
+        logger.info(f"[GPU {dev}] Launching: {' '.join(cmd)}")
+        procs.append(subprocess.Popen(cmd, env=env))
+    for p in procs:
+        p.wait()
+
+def get_epoch(checkpoint):
+    if "=" not in checkpoint.stem:
+        return "0"
+    checkpoint.stem.split("=")[1]
+
+
+def make_env(dataset_path):
+    val_folder = Path(dataset_path) / "validation"
+    env = get_env(val_folder, show_gui=False)
+
+    # insert your own env wrapper
+    # env = Wrapper(env)
+    return env
+
+
+
+class WoGPolicy:
+    def __init__(
+        self,
+        saved_model_path: str = 'your_model_path',
+        unnorm_key: Optional[str] = None,
+        policy_setup: str = "calvin",
+        horizon: int = 0,
+        action_ensemble_horizon: Optional[int] = None,
+        image_size: list[int] = [224, 224],
+        future_action_window_size: int = 15,
+        action_dim: int = 7,
+        action_model_type: str = "DiT-L",
+        action_scale: float = 1.0,
+        use_bf16: bool = False,
+        action_ensemble = True,
+        adaptive_ensemble_alpha = 0.1,
+    ) -> None:
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        if policy_setup == "calvin":
+            unnorm_key = "calvin" if unnorm_key is None else unnorm_key
+            action_ensemble = action_ensemble
+            adaptive_ensemble_alpha = adaptive_ensemble_alpha
+            if action_ensemble_horizon is None:
+                action_ensemble_horizon = 7
+            self.sticky_gripper_num_repeat = 1
+        else:
+            raise NotImplementedError(
+                f"Policy setup {policy_setup} not supported for octo models. The other datasets can be found in the huggingface config.json file."
+            )
+        self.policy_setup = policy_setup
+        self.unnorm_key = unnorm_key
+
+        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
+        self.vla = load_vla(
+          saved_model_path,                       
+          load_for_training=False, 
+          action_model_type=action_model_type,              
+          future_action_window_size=future_action_window_size,
+          action_dim=action_dim,
+        )
+
+        if use_bf16:
+            self.vla.vlm = self.vla.vlm.to(torch.bfloat16)
+        self.vla = self.vla.to("cuda").eval()
+
+        self.image_size = image_size
+        self.action_scale = action_scale
+        self.horizon = horizon
+        self.action_ensemble = action_ensemble
+        self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
+        self.action_ensemble_horizon = action_ensemble_horizon
+        self.sticky_action_is_on = False
+        self.gripper_action_repeat = 0
+        self.sticky_gripper_action = 0.0
+        self.previous_gripper_action = None
+
+        self.task_description = None
+        self.image_history = deque(maxlen=self.horizon)
+        if self.action_ensemble:
+            self.action_ensembler = AdaptiveEnsembler(self.action_ensemble_horizon, self.adaptive_ensemble_alpha)
+        else:
+            self.action_ensembler = None
+        self.num_image_history = 0
+
+    def _add_image_to_history(self, image: np.ndarray) -> None:
+        self.image_history.append(image)
+        self.num_image_history = min(self.num_image_history + 1, self.horizon)
+
+    def reset(self) -> None:
+        self.image_history.clear()
+        if self.action_ensemble:
+            self.action_ensembler.reset()
+        self.num_image_history = 0
+
+        self.sticky_action_is_on = False
+        self.gripper_action_repeat = 0
+        self.sticky_gripper_action = 0.0
+        self.previous_gripper_action = None
+
+    def step(
+        self,obs, goal, *args, **kwargs
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+
+        image = obs["rgb_obs"]["rgb_static"]
+        assert image.dtype == np.uint8
+        self._add_image_to_history(self._resize_image(image))
+        image: Image.Image = Image.fromarray(image)
+        raw_actions, normalized_actions = self.vla.predict_action(image=image, 
+                                                                instruction=goal,
+                                                                unnorm_key=self.unnorm_key,
+                                                                do_sample=False, 
+                                                                calvin_deploy=True,
+                                                                )
+
+        actions = raw_actions[:8,:]
+        return actions
+
+    def _resize_image(self, image: np.ndarray) -> np.ndarray:
+        image = cv.resize(image, tuple(self.image_size), interpolation=cv.INTER_AREA)
+        return image
+
+    def visualize_epoch(
+        self, predicted_raw_actions: Sequence[np.ndarray], images: Sequence[np.ndarray], save_path: str
+    ) -> None:
+        images = [self._resize_image(image) for image in images]
+        ACTION_DIM_LABELS = ["x", "y", "z", "roll", "pitch", "yaw", "grasp"]
+
+        img_strip = np.concatenate(np.array(images[::3]), axis=1)
+
+        # set up plt figure
+        figure_layout = [["image"] * len(ACTION_DIM_LABELS), ACTION_DIM_LABELS]
+        plt.rcParams.update({"font.size": 12})
+        fig, axs = plt.subplot_mosaic(figure_layout)
+        fig.set_size_inches([45, 10])
+
+        # plot actions
+        pred_actions = np.array(
+            [
+                np.concatenate([a["world_vector"], a["rotation_delta"], a["open_gripper"]], axis=-1)
+                for a in predicted_raw_actions
+            ]
+        )
+        for action_dim, action_label in enumerate(ACTION_DIM_LABELS):
+            # actions have batch, horizon, dim, in this example we just take the first action for simplicity
+            axs[action_label].plot(pred_actions[:, action_dim], label="predicted action")
+            axs[action_label].set_title(action_label)
+            axs[action_label].set_xlabel("Time in one episode")
+
+        axs["image"].imshow(img_strip)
+        axs["image"].set_xlabel("Time in one episode (subsampled)")
+        plt.legend()
+        plt.savefig(save_path)
+    
+
+class CustomModel(CalvinBaseModel):
+    def __init__(self):
+        logger.warning("Please implement these methods as an interface to your custom model architecture.")
+        raise NotImplementedError
+
+    def reset(self):
+        """
+        This is called
+        """
+        raise NotImplementedError
+
+    def step(self, obs, goal):
+        """
+        Args:
+            obs: environment observations
+            goal: embedded language goal
+        Returns:
+            action: predicted action
+        """
+        raise NotImplementedError
+
+
+def evaluate_policy(model, env, epoch=0, eval_log_dir=None, debug=False, create_plan_tsne=False):
+    """
+    Run this function to evaluate a model on the CALVIN challenge.
+
+    Args:
+        model: Must implement methods of CalvinBaseModel.
+        env: (Wrapped) calvin env.
+        epoch:
+        eval_log_dir: Path where to log evaluation results. If None, logs to /tmp/evaluation/
+        debug: If True, show camera view and debug info.
+        create_plan_tsne: Collect data for TSNE plots of latent plans (does not work for your custom model)
+
+    Returns:
+        Dictionary with results
+    """
+    conf_dir = Path(__file__).absolute().parents[2] / "conf"
+    task_cfg = OmegaConf.load(conf_dir / "callbacks/rollout/tasks/new_playtable_tasks.yaml")
+    task_oracle = hydra.utils.instantiate(task_cfg)
+    val_annotations = OmegaConf.load(conf_dir / "annotations/new_playtable_validation.yaml")
+
+    eval_log_dir = get_log_dir(eval_log_dir)
+
+    eval_sequences = get_sequences(NUM_SEQUENCES)
+
+    results = []
+    plans = defaultdict(list)
+
+    if not debug:
+        eval_sequences = tqdm(eval_sequences, position=0, leave=True)
+
+    for initial_state, eval_sequence in eval_sequences:
+        result = evaluate_sequence(env, model, task_oracle, initial_state, eval_sequence, val_annotations, plans, debug)
+        results.append(result)
+        if not debug:
+            eval_sequences.set_description(
+                " ".join([f"{i + 1}/5 : {v * 100:.1f}% |" for i, v in enumerate(count_success(results))]) + "|"
+            )
+
+    # if create_plan_tsne:
+    #     create_tsne(plans, eval_log_dir, epoch)
+    print_and_save(results, eval_sequences, eval_log_dir, epoch)
+
+    return results
+
+
+def evaluate_sequence(env, model, task_checker, initial_state, eval_sequence, val_annotations, plans, debug):
+    """
+    Evaluates a sequence of language instructions.
+    """
+    robot_obs, scene_obs = get_env_state_for_initial_condition(initial_state)
+    env.reset(robot_obs=robot_obs, scene_obs=scene_obs)
+
+    success_counter = 0
+    if debug:
+        time.sleep(1)
+        print()
+        print()
+        print(f"Evaluating sequence: {' -> '.join(eval_sequence)}")
+        print("Subtask: ", end="")
+    for subtask in eval_sequence:
+        success = rollout(env, model, task_checker, subtask, val_annotations, plans, debug)
+        if success:
+            success_counter += 1
+        else:
+            return success_counter
+    return success_counter
+
+
+def rollout(env, model, task_oracle, subtask, val_annotations, plans, debug):
+    """
+    Run the actual rollout on one subtask (which is one natural language instruction).
+    """
+    if debug:
+        print(f"{subtask} ", end="")
+        time.sleep(0.5)
+    obs = env.get_obs()
+    # get lang annotation for subtask
+    lang_annotation = val_annotations[subtask][0]
+    model.reset()
+    start_info = env.get_info()
+    action_queue = deque()
+    for step in range(EP_LEN):
+        if len(action_queue) == 0:
+            action_queue.extend(model.step(obs, lang_annotation))
+        action = action_queue.popleft()
+        obs, _, _, current_info = env.step(action)
+        if debug:
+            img = env.render(mode="rgb_array")
+            join_vis_lang(img, lang_annotation)
+            # time.sleep(0.1)
+        if step == 0:
+            # for tsne plot, only if available
+            collect_plan(model, plans, subtask)
+
+        # check if current step solves a task
+        current_task_info = task_oracle.get_task_info_for_set(start_info, current_info, {subtask})
+        if len(current_task_info) > 0:
+            if debug:
+                print(colored("success", "green"), end=" ")
+            return True
+    if debug:
+        print(colored("fail", "red"), end=" ")
+    return False
+
+
+def main():
+    seed_everything(0, workers=True)  
+    parser = argparse.ArgumentParser(description="Evaluate a trained model on multistep sequences with language goals.")
+    parser.add_argument("--dataset_path", type=str, default="calvin_data/task_ABC_D", help="Path to the dataset root directory.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path of the checkpoint",
+    )
+    parser.add_argument("--debug", action="store_true", help="Print debug info and visualize environment.")
+    parser.add_argument("--eval_log_dir", default="calvin/wog_logs", type=str, help="Where to log the evaluation results.")
+    # Speed/compute control
+    # Multi-GPU concurrent eval
+    parser.add_argument("--multi", action="store_true", help="Enable multi-GPU concurrent evaluation.")
+    parser.add_argument("--checkpoints_dir", type=str, default="logs/calvin--image_aug/checkpoints", help="Directory containing checkpoints to evaluate.")
+    parser.add_argument("--start_epoch", type=int, default=12, help="Start epoch to filter checkpoints (inclusive).")
+    parser.add_argument("--devices", type=str, default="0,1,2,3,4,5,6,7", help="Comma-separated GPU IDs to use.")
+    args = parser.parse_args()
+
+    # Multi-run mode
+    if args.multi:
+        devices = [int(x) for x in args.devices.split(",") if x.strip() != ""]
+        checkpoints = _select_checkpoints(args.checkpoints_dir, args.start_epoch, len(devices))
+        if len(checkpoints) == 0:
+            raise ValueError(f"No checkpoints found in {args.checkpoints_dir} with epoch >= {args.start_epoch}")
+        extra = []
+        if args.debug:
+            extra.append("--debug")
+
+        _spawn_multi_runs(Path(__file__), args.dataset_path, args.eval_log_dir, checkpoints, devices, extra)
+        return
+
+    model = WoGPolicy(saved_model_path=args.checkpoint,
+        action_model_type='DiT-L',)
+    env = make_env(args.dataset_path)
+    epoch_match = re.search(r"epoch-(\d+)", Path(args.checkpoint).stem) if args.checkpoint else None
+    epoch = int(epoch_match.group(1)) if epoch_match else 0
+    evaluate_policy(model, env, epoch, eval_log_dir=args.eval_log_dir, debug=args.debug, create_plan_tsne=False)
+
+
+if __name__ == "__main__":
+    main()

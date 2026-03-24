@@ -117,6 +117,19 @@ After that, you can modify and launch the scripts in [`deploy/scripts`](deploy/s
 cd <your_path_to_simpler>
 bash simpler_env/policies/deploy/scripts/wog_put_in_drawer_visual_matching.sh
 ```
+<details>
+<summary><strong>Ps: For Calvin Deployment</strong></summary>
+
+We now support [CALVIN](https://github.com/mees/calvin) deployment. You can convert the CALVIN dataset to RLDS format with [calvin_rlds_builder](https://github.com/hyy02/calvin_rlds_builder). We've registered the calvin dataset in:
+- [prismatic/vla/datasets/rlds/oxe/transforms.py](prismatic/vla/datasets/rlds/oxe/transforms.py)
+- [prismatic/vla/datasets/rlds/oxe/mixtures.py](prismatic/vla/datasets/rlds/oxe/mixtures.py)
+- [prismatic/vla/datasets/rlds/oxe/configs.py](prismatic/vla/datasets/rlds/oxe/configs.py)
+
+for training. For deployment:
+```bash
+mv deploy/wog_policy_calvin.py your_path_to_calvin/calvin_models/calvin_agent/evaluation/ 
+```
+</details>
 
 ## Evaluation in RealWorld
 We provide a sample of RealWorld Deploy wrapper in [deploy/wog_policy_real.py](deploy/wog_policy_real.py). It's supported by [Maniunicon](https://github.com/Universal-Control/ManiUniCon) and you can also use it in other platforms. 
