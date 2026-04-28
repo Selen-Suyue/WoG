@@ -93,7 +93,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node 8 scripts/train.py \
 ```
 
 ## Pretrained Checkpoints
-We provide pretrained checkpoints of the two stages in [huggingface](https://huggingface.co/Selen123/WoG). `WoG-V` is the first-stage and `WoG-A` is the second.
+We provide pretrained checkpoints of the two stages in [huggingface](https://huggingface.co/selensu/WoG). `WoG-V` is the first-stage and `WoG-A` is the second.
 
 ## Evaluation in SIMPLER
 In this section, we provide a minimal evaluation for our models in [SIMPLER](https://simpler-env.github.io/). First, please follow the instruction of [SimplerEnv](https://github.com/simpler-env/SimplerEnv) to install the simulation environment. Next, add our [./deploy](./deploy) to [SimplerEnv/simpler_env/policies](https://github.com/simpler-env/SimplerEnv/tree/main/simpler_env/policies).
